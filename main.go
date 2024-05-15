@@ -3,150 +3,160 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"net"
 	"os"
-	"strconv"
 	"strings"
 	"syscall"
 )
 
+var (
+  socketPath = "/tmp/upgrade.sock"
+  filePath = "myfile"
+  reader = bufio.NewReader(os.Stdin)
+
+  err error
+  openFds []int
+  sockFile *os.File
+)
+
 func main() {
-  fmt.Println("Available options: pid, openfile, closefile, preparesock")
-  reader := bufio.NewReader(os.Stdin)
-  filePath := "myfile"
-  socketPath := "upgrade.sock"
-  var err error
-  var fd int
-  var socketConn *net.UnixConn
-  var socketFd int
+  fmt.Printf(">>> Started process with PID: [%d]\n", os.Getpid())
+  printHelp()
+
 
   for {
+    fmt.Printf("\ninput> ")
     input, _ := reader.ReadSlice('\n')
     str_input := strings.TrimSuffix(string(input), "\n")
 
     if str_input == "pid" {
-      fmt.Printf("PID is : %d\n\n", os.Getpid())
+      fmt.Printf("PID is : %d\n", os.Getpid())
 
     } else if str_input == "openfile" {
-      fd, err = openFile(filePath)
+      f, err := os.Open(filePath)
       handleError(err)
+      fd := int(f.Fd())
+      openFds = append(openFds, fd)
+      fmt.Printf("Opened file, FD = %v\n", fd)
 
     } else if str_input == "closefile" {
-      err = closeFile(fd, filePath)
+      if len(openFds) == 0 {
+        fmt.Printf("No open files to close\n")
+        continue
+      }
+      // Pop the last file descriptor and close the file
+      fd := openFds[len(openFds)-1]
+      openFds = openFds[:len(openFds)-1]
+      err := syscall.Close(fd) 
+      handleError(err)
+      fmt.Printf("Closed file, FD = %v\n", fd)
+
+    } else if str_input == "start-sock" {
+      err = startSock(socketPath)
       handleError(err)
 
-    } else if str_input == "preparesock" {
-      socketFd, err = prepareSock(socketPath)
+    } else if str_input == "connect-sock" {
+      err = connectSock(socketPath)
       handleError(err)
-      fmt.Printf("Bound socket connection %v\n", socketConn)
 
-    } else if strings.Split(str_input, " ")[0] == "sendmsg" {
-      fd, err := strconv.ParseInt(strings.Split(str_input, " ")[1], 10, 8)
-      handleError(err)
-      sendmsg(socketFd, int(fd))
+    } else if str_input == "stop-sock"{
+      sockFile.Close()
+      fmt.Printf("Closed unix socket connexion\n")
 
-    } else if str_input == "recvmsg" {
-      err := recvmsg(socketPath, socketConn)
-      handleError(err)
+    } else if str_input == "lsof" {
+      fmt.Printf("Open file descriptors: %v\n", openFds)
+
+    } else if str_input == "help" {
+      printHelp()
+
+    } else if str_input == "" {
+      continue
+
     } else {
-      fmt.Printf("Unknown option: %s\n", input)
+      fmt.Printf("Unknown option: %s\n", str_input)
     }
   }
 }
 
-func openFile(filePath string) (int, error) {
-  fd, err := syscall.Open(filePath, syscall.O_RDWR, 0)
+// Creates a socket that will be used to transfer open file descriptors of the opening process
+func startSock(sockPath string) (error) {
+  sockFd, err := syscall.Socket(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
   if err != nil {
-    return -1, err
+    return err
   }
+  fmt.Printf("Created socket with fd %v\n", sockFd)
 
-  fmt.Printf("File %s opened, fd %d\n", filePath, fd)
+  syscall.Unlink(sockPath)
+  sockFile := os.NewFile(uintptr(sockFd), sockPath)
 
-  return fd, nil
-}
-
-func closeFile(fd int, filePath string) error {
-  err := syscall.Close(fd)
+  addr := &syscall.SockaddrUnix{Name: sockPath}
+  err = syscall.Bind(sockFd, addr)
   if err != nil {
-     return err
+    return err
   }
+  err = syscall.Listen(sockFd, 1)
+  if err != nil {
+    return err
+  }
+  fmt.Printf("Started listening on socket file %v\n", sockFile)
 
-  fmt.Printf("File %s with fd %d closed\n", filePath, fd)
+  peerFd, _, err := syscall.Accept(sockFd)
+  if err != nil {
+    return err 
+  }
+  fmt.Printf("Accepted from client. Client socket peer fd [%v]\n", peerFd)
+
+  rights := syscall.UnixRights(openFds...) // Sending the file descriptors
+  err = syscall.Sendmsg(peerFd, nil, rights, nil, 0) 
+  if err != nil {
+    return err 
+  }
+  fmt.Printf("Sent message on socket to client peer socket fd [%v]\n", peerFd)
+
   return nil
 }
 
-func prepareSock(path string) (int, error) {
-  syscall.Unlink(path)
-  listener, err := net.Listen("unix", path)
+// Connect to the socket and receive the file descriptors
+func connectSock(sockPath string) (error) {
+  sockFd, err := syscall.Socket(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
   if err != nil {
-    return -1, err
+    return err
   }
+  fmt.Printf("Created socket with fd [%v]\n", sockFd)
 
-  a, err := listener.Accept()
+  addr := &syscall.SockaddrUnix{Name: sockPath}
+  err = syscall.Connect(sockFd, addr)
   if err != nil {
-    return -1, err
+    return err
   }
-  listenConn := a.(*net.UnixConn)
-  
-  f, err := listenConn.File()
-  if err != nil {
-    return -1, err
-  }
+  fmt.Printf("Connected to socket on path [%v]\n", sockPath)
 
-  socketFd := int(f.Fd())
+  oob := make([]byte, syscall.CmsgSpace(4))
+  _, oobn, _, _, err := syscall.Recvmsg(sockFd, nil, oob, 0)
+  fmt.Printf("Received msg from server on fd %v, length of oob data [%v]\n", sockFd, len(oob))
 
-  return socketFd, nil
-}
-
-func sendmsg(socketFd int, fd int) error {
-  fds := make([]int, 1)
-  fds = append(fds, fd)
-
-  rights := syscall.UnixRights(fds...)
-
-  return syscall.Sendmsg(socketFd, nil, rights, nil, 0)
-}
-
-func recvmsg(socketPath string, conn *net.UnixConn) error {
-  if conn == nil {
-    c, err := net.Dial("unix", socketPath)
-    if err != nil {
-      return err
-    }
-
-    conn = c.(*net.UnixConn)
-  }
-
-  f, err := conn.File()
+  messages, err := syscall.ParseSocketControlMessage(oob[:oobn])
   if err != nil {
     return err
   }
 
-  socketFd := int(f.Fd())
+  if len(messages) != 1 { 
+    return fmt.Errorf("received %d messages\n", len(messages))
+  }
+  message := messages[0]
 
-  buf := make([]byte, syscall.CmsgSpace(8))
-
-  fmt.Printf("Syscall recvmsg\n")
-  _,_,_,_, err = syscall.Recvmsg(socketFd, nil, buf, 0)
-  fmt.Printf("DONE Syscall recvmsg\n")
+  fds, err := syscall.ParseUnixRights(&message)
+  if len (fds) == 0 {
+    return fmt.Errorf("received 0 fds\n")
+  }
+  fmt.Printf("Parsed message from server, received fds [%v]", fds)
+  for _, fd := range fds {
+    openFds = append(openFds, fd)
+  }
   if err != nil {
     return err
   }
 
-  // Parse control msgs
-  var msgs []syscall.SocketControlMessage
-  msgs, err = syscall.ParseSocketControlMessage(buf)
-  for i := 0; i < len(msgs); i++ {
-    var fds []int
-    fds, err = syscall.ParseUnixRights(&msgs[i])
-
-    for fi, fd := range fds {
-      fmt.Printf("Received fd %d [%d]\n", fd, fi)
-      syscall.Close(fd)
-    }
-  }
-
-  return nil
+  return err
 }
 
 func handleError(e error) {
@@ -155,3 +165,13 @@ func handleError(e error) {
   }
 }
 
+func printHelp() {
+  fmt.Printf(">>> Available options: pid, openfile, closefile, lsof, start-sock, connect-sock, stop-sock, help\n")
+  fmt.Printf(">>> \tpid:          Prints the process ID\n")
+  fmt.Printf(">>> \topenfile:     Opens the file 'myfile' available on this directory. The FD generated by the kernel is stored in memory\n")
+  fmt.Printf(">>> \tclosefile:    Closes the last stored FD\n")
+  fmt.Printf(">>> \tlsof:         Lists FDs stored in memory\n")
+  fmt.Printf(">>> \tstart-sock:   On a server, starts a socket and listens for incoming client requests\n")
+  fmt.Printf(">>> \tconnect-sock: On a client, connects to a socket and receives FDs from a server\n")
+  fmt.Printf(">>> \tstop-sock:    Stops the socket\n\n")
+}
